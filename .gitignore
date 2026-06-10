@@ -1,0 +1,6 @@
+# venv files
+venv/
+__pycache__/
+notes.md
+.env
+architectural_diagram.png
