@@ -23,6 +23,6 @@ services:
       SECRET_KEY: ${SECRET_KEY}
       JWT_ISSUER: ${JWT_ISSUER}
       JWT_AUDIENCE: ${JWT_AUDIENCE}
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/sportflow_db
       ALGORITHM: ${ALGORITHM}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES}
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/sportflow_db
