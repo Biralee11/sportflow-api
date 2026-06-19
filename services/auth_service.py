@@ -46,7 +46,7 @@ def verify_access_token(token: str):
 # Tells FastAPI where the login endpoint is so it can extract bearer tokens from requests
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
     payload = verify_access_token(token)
     current_user_email = payload.get("sub")
     user = db.query(UserModel).filter(UserModel.email == current_user_email).first()

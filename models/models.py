@@ -21,7 +21,7 @@ class ProductModel(Base):
     price = Column(Numeric(precision=10, scale=2), nullable=False)
     category = Column(String, nullable=False)
     image_url = Column(String)
-    is_active = Column(Boolean, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime, onupdate=lambda: datetime.now(timezone.utc))
 

@@ -52,25 +52,23 @@
   - Never paste secrets anywhere (chat, Slack, tickets). If exposed, regenerate.
   - Production gets a DIFFERENT key, set in Render env vars at deployment
 - Install email-validator: `pip install email-validator`, add to requirements.txt ✅
-- schemas/schemas.py:
-  - RegisterRequest: email (EmailStr), password (Field min_length=8 + validator
-    for uppercase and special char, specific error messages), first_name,
-    last_name (Field min_length=1, max_length=50)
-  - NO role field — role is hardcoded server-side as "customer" (never trust client input)
-  - LoginRequest: email (str, deliberately NOT EmailStr — keeps malformed
-    emails flowing through the same generic error path), password (str,
-    no validation rules — hash comparison is the only judge)
-  - UserResponse: id (int), email (str), first_name (str), last_name (str),
-    role (str), created_at (datetime), updated_at (Optional[datetime] = None
-    — matches nullable=True on the model)
-  - UserResponse used as response_model on register, login, get-profile —
-    filters out hashed_password automatically
+- Pin bcrypt version: pip install bcrypt==4.0.1, update requirements.txt
+ - Newer bcrypt versions are incompatible with passlib, pin to 4.0.1
 - config.py (root):
   - Single place for all env var loading and validation
   - load_dotenv() called once here, nowhere else
   - All variables read with os.getenv(), checked with RuntimeError if None
   - ACCESS_TOKEN_EXPIRE_MINUTES converted to int() after None check
   - All other files import from config, never from os.getenv directly
+- schemas/schemas.py:
+  - RegisterRequest: email (EmailStr), password (str = Field(min_length=8) + field_validator for uppercase and special char with specific error messages), 
+    first_name (Field(min_length=1, max_length=50)), last_name (Field(min_length=1, max_length=50))
+  - NO role field in RegisterRequest — role is hardcoded server-side as "customer" (never trust client input / privilege escalation prevention)
+  - LoginRequest: email (str, deliberately NOT EmailStr), password (str, no validation rules)
+  - UserResponse: id (int), email (str), first_name (str), last_name (str), role (str), created_at (datetime), updated_at (Optional[datetime] = None)
+  - TokenResponse: access_token (str), token_type (str)
+  - UserResponse used as response_model on register — strips hashed_password automatically
+  - TokenResponse used as response_model on login
 - services/auth_service.py:
   - imports from config.py
   - CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -86,33 +84,48 @@
   - User specific business logic: fetch user by id, update profile, change password
   - Separate from auth_service.py which handles token/password operations
 - routers/auth_router.py:
-  - POST /auth/register: validate RegisterRequest → check email not taken → 
-    hash password → create UserModel with role="customer" → add, commit → 
-    return UserResponse
-  - POST /auth/login: validate LoginRequest → query user by email → verify 
-    password → create JWT with sub, role → return token
-- Auth flow to implement:
-  - Register: validate schema → check email not already registered → hash password → create UserModel with role="customer" → add, commit → return UserResponse
-  - Login: generic "invalid login details" for both wrong email and wrong password (user enumeration prevention) → 
-    verify password by hashing attempt and comparing → issue JWT with sub, role, exp, iss, aud
+  - router = APIRouter(prefix="/auth", tags=["Auth"])
+  - POST /register: validate RegisterRequest → check email not taken (400 "Email already registered") → hash password → create UserModel with role="customer" → add, commit, 
+    refresh → return UserResponse
+  - POST /login: validate LoginRequest → query user by email → verify password → 401 "Invalid email or password" if either fails (same message, user enumeration prevention) 
+    → create JWT with sub, role → return TokenResponse
+- routers/init.py: empty file, makes routers a Python package
+- main.py: register auth_router with app.include_router(auth_router.router)
+- seed.py (root):
+  - Creates the first admin user directly in the database (bootstrap problem)
+  - Uses try/finally to ensure db.close() always runs
+  - Run with: python seed.py (venv must be activated, db container must be running)
+  - Never commit real admin credentials — use placeholder or remove before pushing
 - Admin creation:
-  - seed script creates the first admin (bootstrap problem)
-  - admin-only RBAC-protected endpoint creates/promotes further admins
-- RBAC dependency: reads role from JWT, 401 = unknown identity, 403 = known
-  but insufficient role
+  - seed.py creates the first admin
+  - Admin-only RBAC-protected endpoint creates/promotes further admins
+  - Public /register can NEVER create an admin
+- Test register: POST localhost:8000/auth/register with email, password, first_name, last_name
+- Test login: POST localhost:8000/auth/login with email, password
+- Verify JWT claims at jwt.io: sub, role, exp, iss, aud all present
 
 ## Phase 3 - Products and inventory
 - Product endpoints (customer facing)
 - Inventory endpoints with stock locking for race conditions (admin only)
+- services/product_service.py
+- services/inventory_service.py
+- routers/products_router.py
+- routers/inventory_router.py
 
 ## Phase 4 - Cart
 - Redis introduction and setup
-- Cart service (stores in Redis, not PostgreSQL)
+- services/cart_service.py
+- routers/cart_router.py
+- Cart stored in Redis, not PostgreSQL
 
 ## Phase 5 - Orders and payments
 - Order endpoints and service
 - Payment endpoints and service
 - Checkout reads prices from database, never from client (never trust client input)
+- services/order_service.py
+- services/payment_service.py
+- routers/orders_router.py
+- routers/payments_router.py
 
 ## Phase 6 - Polish and deployment
 - Tests
@@ -167,11 +180,25 @@ Always `is None` / `is not None`, never `== None`. PEP 8, None is a singleton.
 ### Classes vs instances
 SessionLocal and FastAPI are classes (blueprints). Adding () creates an instance.
 
+### db.refresh(user) after commit
+After db.commit(), the object in memory doesn't have database-generated values
+like id or created_at yet. Call db.refresh(user) to fetch the updated record
+back from the database before returning it.
+
 ## Environment variables and config
 
-### Professional pattern
-Never hardcode a fallback connection string in code. load_dotenv(), os.getenv(),
-raise RuntimeError with a clear message if missing. Fail loudly, not silently.
+### config.py pattern (professional standard)
+Never scatter load_dotenv() and os.getenv() across multiple files.
+Create config.py in the root, load and validate ALL env vars there,
+import from it everywhere else. One place to change if config ever changes.
+
+### Reading then converting env vars
+Read first, check None, then convert:
+value = os.getenv("KEY")
+if value is None:
+raise RuntimeError("KEY is not set")
+value = int(value)
+Never int(os.getenv("KEY")) in one line, int(None) throws TypeError with no useful message.
 
 ### Code vs config (twelve factor principle)
 Code should never know which environment it runs in. Same database.py runs on Mac,
@@ -183,6 +210,11 @@ Local dev config CAN be committed (postgres:postgres@localhost only works on you
 Secrets and production config NEVER get committed: SECRET_KEY, production database URLs,
 live API keys, anything pointing at real infrastructure.
 
+### Import execution order
+When Python imports a file, it executes it top to bottom completely before
+returning to the importing file. So RuntimeError in config.py fires at
+import time, before any code in the importing file runs.
+
 ### .env vs migrations/env.py
 .env = environment variables file. migrations/env.py = Alembic's Python config.
 Same name, completely different files.
@@ -192,6 +224,11 @@ Completely separate and independent. Upgrading one does not affect the other.
 
 ### pip upgrade prompt
 Safe to ignore. Only upgrade if a package install fails due to outdated pip.
+
+### Why ALGORITHM lives in .env even though it's not secret
+Not about secrecy. About configurability — if you ever switch algorithms,
+one .env change redeploys without touching code. Consistent with twelve factor:
+all config in the environment, regardless of sensitivity.
 
 ## eCommerce concepts
 
@@ -236,6 +273,28 @@ schemas.py = Pydantic classes validating requests/responses. Never mix.
 
 ### Why services layer exists
 Routers handle HTTP only. Services hold business logic. One service per router.
+
+### Response schemas / response_model (security)
+Without a response_model, returning a SQLAlchemy object serializes EVERY column
+including hashed_password. response_model = UserResponse filters output to only
+declared fields, automatically, every time.
+FastAPI intercepts the return value, feeds it through the Pydantic model, serializes to JSON.
+You just return the object — no manual dictionary building needed.
+
+### API layer vs frontend layer
+The API decides what data LEAVES the server (response schemas).
+The frontend decides what data gets DISPLAYED (UI code).
+"The frontend hides sensitive data" is wrong thinking — sensitive data should
+never leave the API in the first place.
+
+### APIRouter prefix and tags
+router = APIRouter(prefix="/auth", tags=["Auth"])
+prefix handles the URL path once — endpoints just define their own suffix (/register, /login).
+tags group endpoints in Swagger docs. Change prefix in one place, all endpoints update.
+
+### init.py in router folders
+Required to make the folder a Python package so imports work.
+Create an empty init.py in routers/, models/, schemas/, services/.
 
 ## Alembic
 
@@ -324,28 +383,93 @@ the role from the JWT.
 Encryption is two-way by design, a key exists to reverse it. Hashing is one-way
 by design, no reverse function exists at all. Passwords are ALWAYS hashed, never
 encrypted. Login works by hashing the attempt and comparing hashes, nothing is
-ever unhashed.
+ever unhashed. Even the developer cannot read user passwords.
+
+### Salting and why hashes look different every time
+bcrypt mixes in a random "salt" before hashing, so the SAME password produces
+a DIFFERENT hash every time. The salt is embedded as a prefix in the hash string
+itself (2b$12
+... = algorithm version, cost factor, salt, then hash).
+verify() extracts the salt FROM the stored hash, re-hashes the attempt with that
+same salt, and compares. Same salt + same password = same result every time.
+
+### bcrypt vs passlib
+bcrypt is the actual algorithm library. passlib (CryptContext) is a wrapper
+supporting multiple algorithms and handling verification/migration logic.
+Both do the same underlying math today, but passlib future-proofs the system.
+
+### schemes list and deprecated="auto"
+schemes=["argon2", "bcrypt"]: first scheme used for all NEW hashes, rest kept
+to verify OLD hashes. deprecated="auto" flags old-scheme logins so the system
+can silently re-hash with the new algorithm on next successful login.
+Enables algorithm migration with zero forced password resets.
+
+### Password hashing library comparison
+pwdlib: direct passlib successor, actively maintained, same multi-scheme
+migration concept, no version conflicts. Recommended for new projects.
+Install: pip install pwdlib[argon2]
+
+argon2-cffi: standalone argon2 library, well maintained, but no multi-scheme
+abstraction. You own migration logic yourself.
+
+bcrypt directly: simplest, no wrapper, always compatible with itself,
+but you own everything including migration.
+
+Recommended stack for new projects: pwdlib + argon2
+SportFlowAPI uses passlib + bcrypt (already built, pinned to 4.0.1)
+
+### bcrypt version compatibility
+bcrypt versions above 4.0.1 are incompatible with passlib and cause a ValueError
+on hashing. Always pin: bcrypt==4.0.1 in requirements.txt.
+Apply in both local venv (pip install bcrypt==4.0.1) and Docker (requirements.txt).
 
 ### Generic login errors (user enumeration)
-Wrong email and wrong password must return the SAME message ("invalid login
-details"). Different messages let attackers confirm which emails are registered
-by firing bulk login attempts.
+Wrong email and wrong password return the SAME message ("Invalid email or password").
+Different messages let attackers confirm which emails are registered by firing
+bulk login attempts. Same principle applies to get_current_user: "Could not
+validate credentials" is deliberately vague.
+
+### Never trust client input / privilege escalation
+Any field the client controls is an attack surface. Security-critical values
+(role, prices, balances, is_active) are NEVER accepted from request bodies,
+always set server-side. If role were in RegisterRequest, any user could send
+"role": "admin" and own every admin endpoint.
+
+### Admin creation pattern
+Public registration hardcodes role="customer" server-side. First admin comes
+from a seed script (bootstrap problem). Further admins only via admin-only
+RBAC-protected endpoint.
+
+### Seed scripts
+Used to insert the first admin (bootstrap problem — no admin exists yet to create one).
+Uses SessionLocal() directly (no dependency injection in scripts).
+Always wrap in try/finally to ensure db.close() runs.
+Run from terminal: python seed.py (venv activated, db container running).
+
+### Secret handling
+Secrets never leave their secure home (.env locally, platform env vars in
+production). Never paste into chat, Slack, tickets, email. A secret that has
+been seen anywhere else is burned, regenerate it. Each environment gets its own key.
 
 ### Defence in depth
 Never claim a system can't be hacked. Reduce likelihood, limit damage:
 2FA on all production accounts, short token expiry, key rotation, rate limiting,
 CAPTCHA, secrets managers (Vault, AWS Secrets Manager) at larger scale.
 
-### Admin creation pattern
-Public registration hardcodes role="customer" server-side. First admin comes
-from a seed script (bootstrap problem). Further admins are created only through
-an admin-only RBAC-protected endpoint.
+### OAuth2PasswordBearer
+Tells FastAPI where the login endpoint is (tokenUrl) so it knows how to extract
+Bearer tokens from Authorization headers automatically.
 
-### Never trust client input / privilege escalation
-Any field the client controls is an attack surface. Security-critical values
-(role, prices, balances, is_active) are NEVER accepted from request bodies,
-always set server-side. Same principle later: checkout reads prices from the
-database, never from the client.
+### get_current_user vs get_current_admin
+get_current_user: extracts token, verifies it, queries DB, returns user. Raises 401.
+get_current_admin: calls get_current_user via Depends, then checks role. Raises 403.
+Protected endpoints use one or the other as a Depends parameter.
+
+### JWT payload is readable but not writable
+JWT payloads are base64 encoded, not encrypted. Anyone can decode and read them.
+The signature prevents modification: change any payload field and the signature
+no longer matches. SECRET_KEY is the only thing preventing forgery.
+Verify at jwt.io — paste any token to see the claims.
 
 ### Secret handling
 Secrets never leave their secure home (.env locally, platform env vars in
@@ -361,8 +485,7 @@ Never hand-roll email regex. Use EmailStr as the field type, requires
 
 ### Field for simple constraints
 Field(min_length=8), Field(min_length=1, max_length=50) handle length rules
-without writing validators. Custom validators only for genuinely custom rules
-(uppercase, special characters).
+without writing validators. Custom validators only for genuinely custom rules.
 
 ### Validating names
 Length limits only. No regex. Real names contain hyphens, apostrophes, spaces,
@@ -400,33 +523,33 @@ Optional[X] = None = field can hold X or None, AND can be omitted entirely,
 defaulting to None if absent.
 For nullable=True columns (like updated_at), always use Optional[X] = None.
 
-## Response schemas / response_model
-
-### Why response_model matters (security)
-Without a response_model, returning a SQLAlchemy object directly serializes
-EVERY column, including hashed_password. response_model = UserResponse on
-the endpoint filters the output down to only the declared fields,
-automatically, every time.
-
-
+### fail fast pattern in validators
+checks that raise, then bare return value at the end. No else needed:
+if not re.search(r"[A-Z]", value):
+raise ValueError("must have uppercase")
+if not re.search(r"[^a-zA-Z0-9]", value):
+raise ValueError("must have special char")
+return value
 
 
 
-# INTERVIEW TALKING POINTS
+
+
+# DOCUMENT 3: INTERVIEW TALKING POINTS
 
 ## Architecture decisions
 
 ### Customer facing vs admin only routes
-Products, orders, cart, users, auth are customer facing. Inventory and payments
-are admin only. Designing access control at the architecture stage, not as an
-afterthought, shows security thinking.
+Products, orders, cart, users, auth are customer facing (teal in diagram).
+Inventory and payments are admin only (coral). Designing access control at the
+architecture stage shows security thinking from day one.
 
 ### Services layer
 Routers handle HTTP only, business logic lives in services, one service per
 router. Cleaner, testable, maintainable.
 
 ### Why order_items exists
-Many to many between orders and products. Also captures price_at_purchase so
+Many to many between orders and products. Captures price_at_purchase so
 historical orders are immune to future price changes.
 
 ### Inventory as a separate table
@@ -441,76 +564,98 @@ reference valid products.
 Temporary, high frequency session data belongs in memory. Database is for
 permanent records. Much faster cart operations.
 
-## Race conditions and stock locking
-Cart add does not reserve stock. At checkout the system locks the inventory row,
-checks quantity, exactly one concurrent transaction succeeds. This is how real
-time eCommerce handles concurrent purchases at scale. (Will implement in Phase 3.)
+### models.py vs schemas.py separation
+Database layer and API contract layer deliberately separated. Cleaner and
+easier to maintain than mixing them.
+
+### CORS configured without a frontend
+Production standard practice. Shows understanding of how APIs serve real
+frontends in the wild.
+
+### One models.py vs split files
+Deliberate choice for this project size. Understand how to split per domain
+with __init__.py imports for larger codebases. Structure should match scale.
+
+---
 
 ## Data integrity
 
 ### Numeric over Float for money
 Float precision errors (0.1 + 0.2 = 0.30000000000000004) are unacceptable for
-money. Numeric(10, 2) is exact. Knowing this distinction matters in fintech
-and eCommerce.
+money. Numeric(10, 2) is exact. Knowing this matters in fintech and eCommerce.
+
+---
 
 ## Configuration and security
 
 ### Code vs config separation (twelve factor)
-Code never knows its environment. The same database.py runs locally, in Docker,
-and on Render, only environment variables change. No hardcoded fallbacks, fail
-loudly if config is missing.
+Code never knows its environment. Same database.py runs locally, in Docker, on
+Render. Only environment variables change. No hardcoded fallbacks, fail loudly
+if config is missing.
+
+### config.py as single source of truth
+All env vars loaded, validated, converted in one file. Every other file imports
+from config. Fail-fast RuntimeError on startup if anything is missing.
 
 ### Secrets vs local dev config
 Local dev credentials (postgres:postgres@localhost) are safe to commit, they
-only work on the developer's machine. Secrets (SECRET_KEY, production URLs,
-live API keys) live only in .env locally and platform environment variables
-in production. I questioned this distinction myself during the build.
+only work on the developer's machine. Secrets live only in .env locally and
+platform env vars in production. Never in the repo.
 
 ### Alembic reads config from environment
-No credentials in alembic.ini (it gets committed). env.py overrides
+No credentials in alembic.ini (committed to git). env.py overrides
 sqlalchemy.url from the environment at runtime.
 
-## Code quality
+---
 
-### models.py vs schemas.py separation
-Database layer and API contract layer deliberately separated. Some projects mix
-them, separating is cleaner and easier to maintain.
+## Auth and security
 
-### CORS configured without a frontend
-Production standard practice, shows understanding of how APIs serve real
-frontends in the wild.
+### Hashing vs encryption (classic interview question)
+Encryption is reversible by design (key exists). Hashing is one-way by design
+(no reverse exists). Login compares hashes, never unhashes. Even the developer
+cannot read user passwords.
 
-### One models.py vs split files
-Deliberate choice for this project size. Know how to split per domain with
-__init__.py imports for larger codebases. Structure should match scale.
+### Salting explained
+Same password produces different hashes each time because bcrypt embeds a random
+salt. verify() extracts the salt from the stored hash, re-hashes the attempt
+with it, and compares. Shows you understand the mechanism, not just the API call.
 
-## Auth and security (Phase 2)
-
-### Hashing vs encryption
-Classic interview question. Encryption is reversible by design (key exists),
-hashing is one-way by design (no reverse exists). Login compares hashes, never
-unhashes. Even the developer cannot read user passwords.
+### JWT payload is readable but not writable
+JWT payloads are base64 encoded, not encrypted. Anyone can decode and read them.
+But the signature prevents modification: change any payload field and the
+signature no longer matches. SECRET_KEY is the only thing preventing forgery.
+Classic interview question: "Are you comfortable with JWT payloads being readable?"
+Answer: yes, because they contain no secrets and the signature makes them tamper-proof.
 
 ### User enumeration prevention
 Login returns the same generic error for wrong email and wrong password.
-Different messages let attackers build verified lists of registered emails
-from error responses alone. Register endpoint leaks similar info, mitigated
-with rate limiting (slowapi in Phase 6), CAPTCHA, or verify-by-email patterns.
+Register leaks similar info, mitigated with rate limiting (Phase 6), CAPTCHA,
+or verify-by-email patterns. Applies throughout: "Could not validate credentials"
+on get_current_user is also deliberately vague.
 
 ### Privilege escalation / never trust client input
 role is not a field in RegisterRequest. If it were, any user could send
-"role": "admin" and own every admin endpoint. Role is hardcoded server-side.
-Same principle protects prices at checkout in Phase 5.
+"role": "admin" and own every admin endpoint. Same principle protects
+prices at checkout in Phase 5.
 
 ### Admin bootstrap
-First admin via seed script (no admin exists yet to create one), further
-admins via admin-only RBAC-protected endpoint. Public registration can never
-produce an admin.
+First admin via seed script (no admin exists yet to create one). Further admins
+via admin-only RBAC-protected endpoint. Public registration can never produce an admin.
+
+### Token valid but user deleted
+If an account is deleted but the token hasn't expired, the token passes
+cryptographic verification but the DB query returns None. Raises 401, not 403,
+because the identity cannot be confirmed. Shows you think about edge cases.
+
+### deprecated="auto" for algorithm migration
+Existing hashes keep working, new registrations use the new algorithm,
+existing users silently migrate on next successful login. Zero forced password
+resets. Senior-level thinking about long-term maintenance.
 
 ### Defence in depth mindset
-Never say "this can't be hacked". Say "here's how I reduce the chance and
-limit the damage": 2FA, short token expiry (30 min), key rotation, separate
-keys per environment, rate limiting, secrets managers at scale.
+Never say "this can't be hacked". Say "here's how I reduce the chance and limit
+the damage": 2FA, short token expiry (30 min), key rotation, separate keys per
+environment, rate limiting, secrets managers at scale.
 
 ### 401 vs 403
 401 = identity unknown (bad/missing token). 403 = identity known, permission
@@ -522,28 +667,14 @@ exponentially stronger and hashing makes storage length-independent. Rejecting
 a 40-char password is an anti-pattern.
 
 ### response_model as a security feature
-Declaring response_model = UserResponse on an endpoint isn't just
-documentation, it actively strips fields like hashed_password from every
-response, even if the endpoint code returns the full ORM object. Defence
-in depth applied to outgoing data, not just incoming.
+Declaring response_model = UserResponse actively strips fields like
+hashed_password from every response, even if the endpoint returns the full ORM
+object. Defence in depth applied to outgoing data.
 
-### API layer vs frontend layer (correct mental model)
-The API decides what data LEAVES the server (response schemas). The frontend
-decides what data gets DISPLAYED to a human (UI code). Saying "the frontend
-hides sensitive data" is a red flag, it implies the frontend is a security
-boundary, it isn't. Sensitive data should never leave the API in the first
-place.
-
-### role in UserResponse, not a secret
-role is included in every user response, customer or admin. It's not hidden
-from anyone, it's just rarely displayed to customers because there's no UI
-reason to. Admins/frontends use it to make UI decisions (show/hide admin
-controls), the actual access control is the RBAC check on the backend, the
-UI is just UX polish.
-
-### created_at/updated_at, dual purpose
-Useful to customers ("member since", "last updated") and essential to admins
-for support and fraud investigation (account age vs activity patterns).
+### API layer vs frontend layer
+The API decides what data leaves the server. The frontend decides what gets
+displayed. Saying "the frontend hides sensitive data" is a red flag — it implies
+the frontend is a security boundary. It isn't.
 
 ### get_current_user dependency chain
 FastAPI's Depends chains automatically: get_current_admin calls
@@ -560,3 +691,15 @@ handling concurrent purchases at scale. (Phase 3.)
 slowapi will be added to protect register and login endpoints from enumeration
 and brute force attacks. Shows awareness of production hardening beyond just
 making the happy path work.
+
+### Password hashing library awareness
+Know the landscape beyond just passlib. pwdlib is the modern successor to
+passlib, actively maintained, same multi-scheme migration concept but without
+the bcrypt version conflicts. argon2 is the stronger algorithm (won NIST's
+password hashing competition in 2015). For new projects: pwdlib + argon2.
+Shows you evolve your stack deliberately, not just copy what you last used.
+
+### bcrypt version pinning
+Newer bcrypt versions break passlib compatibility. Pinned to bcrypt==4.0.1.
+Shows awareness of dependency management in production systems, not just
+installing latest and hoping for the best.
