@@ -27,3 +27,7 @@ def update_product(request: ProductUpdateRequest, id: int, db: Session = Depends
 @router.delete("/{id}", response_model=ProductResponse)
 def delete_product(id: int, db: Session = Depends(get_db), current_admin = Depends(get_current_admin)):
     return product_service.delete_product(db, id)
+
+@router.post("/{id}/reactivate", response_model=ProductResponse)
+def reactivate_product(id: int, db: Session = Depends(get_db), current_admin = Depends(get_current_admin)):
+    return product_service.reactivate_product(db, id)

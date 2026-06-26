@@ -46,3 +46,12 @@ def delete_product(db: Session, id: int):
     db.commit()
     db.refresh(product)
     return product
+
+def reactivate_product(db: Session, id: int):
+    product = db.query(ProductModel).filter(ProductModel.id == id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    product.is_active = True
+    db.commit()
+    db.refresh(product)
+    return product

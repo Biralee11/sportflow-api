@@ -27,3 +27,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(ACCESS_TOKEN_EXPIRE_MINUTES)
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL is None:
     raise RuntimeError("DATABASE_URL environment variable is not set")
+
+REDIS_URL = os.getenv("REDIS_URL")
+if REDIS_URL is None:
+    raise RuntimeError("REDIS_URL environment variable is not set")

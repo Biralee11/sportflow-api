@@ -38,18 +38,18 @@ class TokenResponse(BaseModel):
     token_type: str
 
 class ProductCreateRequest(BaseModel):
-    name: str
-    description: str
-    price: Decimal
-    category: str
-    image_url: Optional[str] = None
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=1000)
+    price: Decimal = Field(gt=0)
+    category: str = Field(min_length=1, max_length=50)
+    image_url: Optional[str] = Field(None, max_length=500)
 
 class ProductUpdateRequest(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    price: Optional[Decimal] = None
-    category: Optional[str] = None
-    image_url: Optional[str] = None
+    name: Optional[str] = Field(None, max_length=100)
+    description: Optional[str] = Field(None, max_length=1000)
+    price: Optional[Decimal] = Field(None, gt=0)
+    category: Optional[str] = Field(None, max_length=50)
+    image_url: Optional[str] = Field(None, max_length=500)
 
 class ProductResponse(BaseModel):
     id: int
@@ -63,13 +63,13 @@ class ProductResponse(BaseModel):
     updated_at: Optional[datetime] = None
 
 class InventoryCreateRequest(BaseModel):
-    product_id: int
-    size: str
-    quantity: int
+    product_id: int = Field(gt=0)
+    size: str = Field(min_length=1, max_length=20)
+    quantity: int = Field(ge=0)
 
 class InventoryUpdateRequest(BaseModel):
-    size: Optional[str] = None
-    quantity: Optional[int] = None
+    size: Optional[str] = Field(None, max_length=20)
+    quantity: Optional[int] = Field(None, ge=0)
 
 class InventoryResponse(BaseModel):
     id: int
@@ -78,3 +78,14 @@ class InventoryResponse(BaseModel):
     quantity: int
     created_at: datetime
     updated_at: Optional[datetime] = None
+
+class CartItemRequest(BaseModel):
+    product_id: int = Field(gt=0)
+    size: str = Field(min_length=1, max_length=20)
+    quantity: int = Field(gt=0)
+
+class CartItemResponse(BaseModel):
+    product_id: int
+    size: str
+    quantity: int
+    price: Decimal

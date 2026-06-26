@@ -12,6 +12,11 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+  
+  redis:
+    image: redis:7
+    ports:
+    - "6379:6379"
 
   api:
     build: .
@@ -19,6 +24,7 @@ services:
       - "8000:8000"
     depends_on:
       - db
+      - redis
     environment:
       SECRET_KEY: ${SECRET_KEY}
       JWT_ISSUER: ${JWT_ISSUER}
@@ -26,3 +32,4 @@ services:
       ALGORITHM: ${ALGORITHM}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES}
       DATABASE_URL: postgresql://postgres:postgres@db:5432/sportflow_db
+      REDIS_URL: redis://redis:6379

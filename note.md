@@ -66,9 +66,8 @@
   - NO role field in RegisterRequest — role is hardcoded server-side as "customer" (never trust client input / privilege escalation prevention)
   - LoginRequest: email (str, deliberately NOT EmailStr), password (str, no validation rules)
   - UserResponse: id (int), email (str), first_name (str), last_name (str), role (str), created_at (datetime), updated_at (Optional[datetime] = None)
-  - TokenResponse: access_token (str), token_type (str)
   - UserResponse used as response_model on register — strips hashed_password automatically
-  - TokenResponse used as response_model on login
+  - TokenResponse used as response_model on login. access_token (str), token_type (str)
 - services/auth_service.py:
   - imports from config.py
   - CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -81,16 +80,18 @@
   - get_current_user(token, db) -> UserModel — extracts email from payload["sub"], queries DB, raises 401 if not found
   - get_current_admin(current_user) -> UserModel — raises 403 "Insufficient permissions" if role != "admin"
 - services/user_service.py:
-  - User specific business logic: fetch user by id, update profile, change password
   - Separate from auth_service.py which handles token/password operations
+  - register(db, request): email uniqueness check, hash password, create UserModel with role="customer", add/commit/refresh, return user
+  - login(db, request): query by email, verify password, raise 401 with generic message if either fails, return TokenResponse dict
+  - Imports hash_password, verify_password, create_access_token from auth_service.py (services can call other services)
+  - Future additions: get_user_by_id, update_user, change_password (for user router in Phase 6)
 - routers/auth_router.py:
   - router = APIRouter(prefix="/auth", tags=["Auth"])
-  - POST /register: validate RegisterRequest → check email not taken (400 "Email already registered") → hash password → create UserModel with role="customer" → add, commit, 
-    refresh → return UserResponse
-  - POST /login: validate LoginRequest → query user by email → verify password → 401 "Invalid email or password" if either fails (same message, user enumeration prevention) 
-    → create JWT with sub, role → return TokenResponse
+  - POST /register: calls user_service.register(db, request), response_model=UserResponse
+  - POST /login: calls user_service.login(db, request), response_model=TokenResponse
+  - Router is lean, no business logic, just HTTP wiring
 - routers/init.py: empty file, makes routers a Python package
-- main.py: register auth_router with app.include_router(auth_router.router)
+- main.py: register all routers with app.include_router(), e.g auth_router with app.include_router(auth_router.router)
 - seed.py (root):
   - Creates the first admin user directly in the database (bootstrap problem)
   - Uses try/finally to ensure db.close() always runs
@@ -107,10 +108,45 @@
 ## Phase 3 - Products and inventory
 - Product endpoints (customer facing)
 - Inventory endpoints with stock locking for race conditions (admin only)
-- services/product_service.py
-- services/inventory_service.py
-- routers/products_router.py
-- routers/inventory_router.py
+- schemas/schemas.py additions:
+  - ProductCreateRequest: name, description, price (Decimal), category, image_url (Optional)
+  - ProductUpdateRequest: all fields Optional
+  - ProductResponse: id, name, description, price, category, image_url, is_active, created_at, updated_at
+  - InventoryCreateRequest: product_id, size, quantity
+  - InventoryUpdateRequest: size and quantity both Optional
+  - InventoryResponse: id, product_id, size, quantity, created_at, updated_at
+- services/product_service.py:
+  - Convention: db first in all service function signatures
+  - get_all_products(db, page, limit): filter is_active==True, pagination with offset/limit
+  - get_product_by_id(db, id): raises 404 if not found
+  - create_product(db, request): creates ProductModel, add/commit/refresh
+  - update_product(db, id, request): if-checks for each Optional field, commit/refresh
+  - delete_product(db, id): soft delete, sets is_active=False, commit/refresh, returns product
+- services/inventory_service.py:
+  - get_all_inventory(db, page, limit): pagination, no is_active filter (admin sees all)
+  - get_inventory_by_product(db, product_id): returns List, uses .all() not .first()
+  - create_inventory(db, request): creates InventoryModel, add/commit/refresh
+  - update_inventory(db, id, request): if-checks for size and quantity
+  - delete_inventory(db, id): HARD delete (safe, order_items captures price_at_purchase), returns message dict
+  - decrement_stock(db, id, quantity_requested): SELECT FOR UPDATE lock, 404 if not found, 409 if insufficient stock, decrement, commit (releases lock automatically), refresh, return inventory
+- routers/products_router.py:
+  - prefix="/products", tags=["Product"]
+  - GET / : public, response_model=List[ProductResponse]
+  - GET /{id}: public, response_model=ProductResponse
+  - POST /: admin only, response_model=ProductResponse
+  - PUT /{id}: admin only, response_model=ProductResponse
+  - DELETE /{id}: admin only, response_model=ProductResponse (returns deactivated product)
+  - Import service as module: from services import product_service, call product_service.function()
+- routers/inventory_router.py:
+  - prefix="/inventory", tags=["Inventory"]
+  - All endpoints admin only
+  - GET /: response_model=List[InventoryResponse]
+  - GET /product/{product_id}: response_model=List[InventoryResponse]
+  - POST /: response_model=InventoryResponse
+  - PUT /{id}: response_model=InventoryResponse
+  - DELETE /{id}: no response_model (returns message dict)
+  - decrement_stock not wired to a router endpoint, called internally from order service in Phase 5
+- main.py: registered auth_router, products_router, inventory_router
 
 ## Phase 4 - Cart
 - Redis introduction and setup
@@ -121,6 +157,7 @@
 ## Phase 5 - Orders and payments
 - Order endpoints and service
 - Payment endpoints and service
+- Checkout calls inventory_service.decrement_stock() with SELECT FOR UPDATE locking
 - Checkout reads prices from database, never from client (never trust client input)
 - services/order_service.py
 - services/payment_service.py
@@ -128,6 +165,7 @@
 - routers/payments_router.py
 
 ## Phase 6 - Polish and deployment
+- User router: GET /users/me, PUT /users/me (calls user_service functions)
 - Tests
 - Rate limiting with slowapi (protects register/login from enumeration and brute force)
 - Deployment to Render (fresh SECRET_KEY in Render env vars, 2FA on accounts)
@@ -160,12 +198,12 @@ Float has precision issues, 0.1 + 0.2 gives 0.30000000000000004.
 Use Numeric(precision=10, scale=2). precision = total digits, scale = decimal places.
 precision and scale go INSIDE Numeric(): Column(Numeric(precision=10, scale=2))
 
+### Soft delete vs hard delete
+Soft delete: set is_active=False. Use for products, users, anything with historical relationships.
+Hard delete: db.delete(). Safe for inventory size variants since order_items captures everything at purchase time.
+
 ### Quantity vs money types
 Quantity is a count, use Integer. Money needs decimals, use Numeric.
-
-### Soft delete
-Never delete records. Use an is_active boolean set to False. Preserves historical
-data and keeps old relationships intact.
 
 ### Nullable rule for timestamps
 created_at: nullable=False, always has a value.
@@ -180,10 +218,65 @@ Always `is None` / `is not None`, never `== None`. PEP 8, None is a singleton.
 ### Classes vs instances
 SessionLocal and FastAPI are classes (blueprints). Adding () creates an instance.
 
+### fail fast pattern in validators
+checks that raise, then bare return value at the end. No else needed:
+if not re.search(r"[A-Z]", value):
+raise ValueError("must have uppercase")
+if not re.search(r"[^a-zA-Z0-9]", value):
+raise ValueError("must have special char")
+return value
+
+### Chaining SQLAlchemy query methods
+.filter(), .offset(), .limit(), .with_for_update() must all be called BEFORE .all() or .first().
+.all() and .first() execute the query and return results (list or object). You cannot chain methods onto results.
+
+### SELECT FOR UPDATE (row locking)
+db.query(Model).filter(...).with_for_update().first()
+Locks the row for the duration of the transaction. Lock releases automatically on db.commit() or rollback.
+Use for race condition prevention on concurrent stock decrements.
+
+### is_active vs quantity (independent concerns)
+is_active = False means "not for sale" (business decision).
+quantity = 0 means "physically out of stock" (inventory state).
+A product can be inactive with stock in the warehouse, or active with zero stock.
+They are tracked independently by design.
+
 ### db.refresh(user) after commit
 After db.commit(), the object in memory doesn't have database-generated values
 like id or created_at yet. Call db.refresh(user) to fetch the updated record
 back from the database before returning it.
+
+## Pagination
+
+### Pattern
+GET endpoint accepts page: int = 1, limit: int = 20 as query parameters (defaults in router only).
+Service function takes page and limit as required params (no defaults).
+Query: .filter(...).offset((page - 1) * limit).limit(limit).all()
+offset = how many records to skip. limit = how many to return.
+FastAPI reads ?page= and ?limit= from URL automatically based on parameter names.
+
+### When to add pagination
+Any list endpoint that could grow large over time. Products, inventory, orders, etc.
+Never return unbounded lists in production.
+
+## Service layer conventions
+
+### db first in service functions
+def function_name(db: Session, id: int, request: Schema):
+db always first, id/identifiers second, request data last.
+
+### request first in router functions
+def endpoint_name(request: Schema, id: int, db: Session = Depends(get_db), current_user = Depends(...)):
+Body/path params first, dependencies (db, auth) last. Idiomatic FastAPI style.
+
+### Services can call other services
+user_service.py imports from auth_service.py. This is correct and professional.
+The rule is routers don't contain business logic, not that services can't talk to each other.
+
+### Import service as module in routers
+from services import product_service
+then call product_service.create_product(db, request)
+Avoids name collision where router function name shadows imported service function name.
 
 ## Environment variables and config
 
@@ -247,8 +340,19 @@ inventory, not inventories. Exception to the plural table naming convention.
 
 ### Race conditions and stock locking
 Cart does not reserve stock, two users can add the same last item. Stock locks at
-checkout only: lock the inventory record, check quantity, one transaction succeeds,
-the other gets "item no longer available".
+checkout via SELECT FOR UPDATE: lock the inventory record, check quantity, one transaction succeeds,
+the other gets the updated (zero) quantity, and is rejected with 409 with a message like "item no longer available"
+
+## True simultaneity does not exist
+Even nanosecond-apart requests resolve sequentially at the hardware level:
+network packets travel through physical cables with different latencies,
+server hardware processes requests through a single bus,
+CPU executes instructions sequentially per core,
+memory controller serializes writes.
+The database lock manager processes acquisition requests sequentially.
+Physics determines the order before the lock manager ever needs to decide.
+Client-side timing (device, network speed) does not determine who wins.
+What matters is which request's data is processed by the DATABASE SERVER's hardware first.
 
 ### Cart storage
 Cart lives in Redis (in memory, fast, temporary session data).
@@ -262,6 +366,12 @@ Never store images in the database. Store in S3 or similar, save only the URL st
 ### CORS
 Cross Origin Resource Sharing, controls which domains may call your API.
 Configure it even without a frontend, production standard.
+
+## response_model
+Filters output to declared fields only. Strips hashed_password automatically.
+FastAPI serializes the return value through the Pydantic model to JSON.
+Just return the object, no manual dict building needed.
+List endpoints: response_model=List[SchemaName]. Import List from typing.
 
 ### add_middleware structure
 app.add_middleware(MiddlewareClass, param=value, ...). Middleware class first,
@@ -288,6 +398,7 @@ The frontend decides what data gets DISPLAYED (UI code).
 never leave the API in the first place.
 
 ### APIRouter prefix and tags
+for example
 router = APIRouter(prefix="/auth", tags=["Auth"])
 prefix handles the URL path once — endpoints just define their own suffix (/register, /login).
 tags group endpoints in Swagger docs. Change prefix in one place, all endpoints update.
@@ -373,17 +484,25 @@ A bare . matches any character. Use \. for a literal dot.
 ### RBAC (Role Based Access Control)
 Every user has a role (customer, admin) stored in the users table. Endpoints
 check the role before allowing access. Implemented via a dependency that reads
-the role from the JWT.
+the role from the JWT. get_current_user returns user, get_current_admin checks role.
+Protected endpoints use Depends(get_current_user) or Depends(get_current_admin).
+current_admin parameter doesn't need to be used in the function body, its presence triggers the check.
 
 ### 401 vs 403
-401 Unauthorised = we don't know who you are (missing/invalid token).
-403 Forbidden = we know who you are, but you're not allowed to do this.
+401 identity unknown = we don't know who you are (missing/invalid token).
+403 identity known, insufficient permission = we know who you are, but you're not allowed to do this.
+If Token valid but user deleted = 401 (identity unconfirmable).
 
 ### Hashing vs encryption
 Encryption is two-way by design, a key exists to reverse it. Hashing is one-way
 by design, no reverse function exists at all. Passwords are ALWAYS hashed, never
 encrypted. Login works by hashing the attempt and comparing hashes, nothing is
 ever unhashed. Even the developer cannot read user passwords.
+
+### bcrypt vs passlib
+bcrypt is the actual algorithm library. passlib (CryptContext) is a wrapper
+supporting multiple algorithms and handling verification/migration logic.
+Both do the same underlying math today, but passlib future-proofs the system.
 
 ### Salting and why hashes look different every time
 bcrypt mixes in a random "salt" before hashing, so the SAME password produces
@@ -393,10 +512,9 @@ itself (2b$12
 verify() extracts the salt FROM the stored hash, re-hashes the attempt with that
 same salt, and compares. Same salt + same password = same result every time.
 
-### bcrypt vs passlib
-bcrypt is the actual algorithm library. passlib (CryptContext) is a wrapper
-supporting multiple algorithms and handling verification/migration logic.
-Both do the same underlying math today, but passlib future-proofs the system.
+### bcrypt + passlib version pin
+
+bcrypt==4.0.1. Pin in requirements.txt AND install locally in venv.
 
 ### schemes list and deprecated="auto"
 schemes=["argon2", "bcrypt"]: first scheme used for all NEW hashes, rest kept
@@ -523,14 +641,6 @@ Optional[X] = None = field can hold X or None, AND can be omitted entirely,
 defaulting to None if absent.
 For nullable=True columns (like updated_at), always use Optional[X] = None.
 
-### fail fast pattern in validators
-checks that raise, then bare return value at the end. No else needed:
-if not re.search(r"[A-Z]", value):
-raise ValueError("must have uppercase")
-if not re.search(r"[^a-zA-Z0-9]", value):
-raise ValueError("must have special char")
-return value
-
 
 
 
@@ -548,6 +658,9 @@ architecture stage shows security thinking from day one.
 Routers handle HTTP only, business logic lives in services, one service per
 router. Cleaner, testable, maintainable.
 
+### Auth refactor
+Refactored auth router to move register/login logic into user_service.py, keeping the router responsible only for HTTP concerns. Shows awareness of clean architecture, not just "does it work".
+
 ### Why order_items exists
 Many to many between orders and products. Captures price_at_purchase so
 historical orders are immune to future price changes.
@@ -556,9 +669,11 @@ historical orders are immune to future price changes.
 Products can have variants (sizes), each with independent stock. Stock inside
 the products table cannot model that cleanly.
 
-### Soft delete on products
-is_active boolean instead of deleting rows. Preserves history, old orders still
-reference valid products.
+### Soft delete vs hard delete
+Products = soft delete (is_active=False). Preserves history. Inventory size variants = hard delete (safe, no orphan risk since order_items captures purchase data).
+
+### is_active vs quantity
+is_active = business decision (are we selling this?). quantity = physical stock count. Independent by design. A product can be inactive with warehouse stock, or active with zero stock in one size.
 
 ### Cart in Redis not PostgreSQL
 Temporary, high frequency session data belongs in memory. Database is for
@@ -576,13 +691,18 @@ frontends in the wild.
 Deliberate choice for this project size. Understand how to split per domain
 with __init__.py imports for larger codebases. Structure should match scale.
 
+### Pagination on list endpoints
+Added to all list endpoints. Prevents unbounded responses. Shows awareness of real-world scale, not just "does it work on my laptop". Uses page/limit query params, offset calculation server-side.
+
 ---
 
 ## Data integrity
 
-### Numeric over Float for money
-Float precision errors (0.1 + 0.2 = 0.30000000000000004) are unacceptable for
-money. Numeric(10, 2) is exact. Knowing this matters in fintech and eCommerce.
+### Numeric/Decimal over Float for money
+Float precision errors are unacceptable for financial data. Numeric(10,2) in SQLAlchemy, Decimal in Pydantic. Knowing this matters in fintech and eCommerce.
+
+### response_model as security
+Strips hashed_password automatically on every response even if endpoint returns full ORM object.
 
 ---
 
@@ -608,7 +728,27 @@ sqlalchemy.url from the environment at runtime.
 
 ---
 
+## Race conditions and concurrency
+
+### SELECT FOR UPDATE
+Row-level lock at checkout. One transaction proceeds, concurrent transactions pause, get updated quantity, rejected with 409 Insufficient stock. Cart add never reserves stock.
+
+### True simultaneity doesn't exist
+Network packets travel through physical cables with real latency differences. Server hardware and CPU process instructions sequentially. Memory controller serializes writes. Lock manager processes acquisition requests sequentially. Physics determines order before the lock manager decides anything. Client-side timing (device/network) is irrelevant, server-side hardware processing order is what matters.
+
+### Interview-ready line
+"Row-level locking guarantees serializability of conflicting transactions even under concurrent load, because the lock manager processes acquisition requests sequentially. At a physical level, true simultaneity doesn't exist — hardware and network physics impose a sequential order before the lock manager needs to make any decision."
+
 ## Auth and security
+
+### config.py as single source of truth
+All env vars loaded, validated, fail-fast RuntimeError on startup.
+
+### Twelve factor / code vs config
+Same code runs everywhere. Only env vars change. No hardcoded fallbacks.
+
+### Secrets vs local dev config
+postgres:postgres@localhost is safe to commit (only works on your machine). SECRET_KEY, production URLs, API keys never committed.
 
 ### Hashing vs encryption (classic interview question)
 Encryption is reversible by design (key exists). Hashing is one-way by design
@@ -636,7 +776,7 @@ on get_current_user is also deliberately vague.
 ### Privilege escalation / never trust client input
 role is not a field in RegisterRequest. If it were, any user could send
 "role": "admin" and own every admin endpoint. Same principle protects
-prices at checkout in Phase 5.
+prices at checkout in Phase 5. Never trust client input for security-critical fields.
 
 ### Admin bootstrap
 First admin via seed script (no admin exists yet to create one). Further admins
@@ -703,3 +843,18 @@ Shows you evolve your stack deliberately, not just copy what you last used.
 Newer bcrypt versions break passlib compatibility. Pinned to bcrypt==4.0.1.
 Shows awareness of dependency management in production systems, not just
 installing latest and hoping for the best.
+
+---
+## ADDENDUM: Race conditions deep dive
+
+### SELECT FOR UPDATE mechanism
+Lock acquired on row. Concurrent transaction waits. First transaction checks quantity, decrements, commits. Lock releases. Second transaction resumes, sees updated (zero) quantity, raises 409.
+
+### Why true simultaneity doesn't exist
+1. Network: physical cable/router latency differences mean nanosecond arrival gaps
+2. Hardware: single bus, sequential CPU instruction execution, serialized memory writes
+3. Database: lock manager itself processes acquisition requests sequentially
+  By the time SELECT FOR UPDATE executes, physics has already imposed an order.
+
+### Client vs server timing
+Customer's device and network speed don't decide who wins. The DATABASE SERVER's hardware processing order determines it. Don't conflate these in an interview.
