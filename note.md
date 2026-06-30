@@ -16,8 +16,8 @@
 - main.py: FastAPI() instance, CORS middleware (allow all for now), root endpoint
 - Docker setup:
   - `Dockerfile`: FROM python:3.14, WORKDIR /app, COPY requirements, RUN pip install, COPY . ., CMD uvicorn with host 0.0.0.0 port 8000
-  - `docker-compose.yml`: db service (postgres:16, port 5432:5432, named volume), api service (build ., port 8000:8000, depends_on db)
-  - Local DATABASE_URL written explicitly in compose with `db` host (local dev config, safe to commit)
+  - `docker-compose.yml`: db service (postgres:16, port 5432:5432, named volume), redis service (redis:7, port 6379:6379), api service (build ., port 8000:8000, depends_on db and redis)
+  - Local DATABASE_URL and REDIS_URL use localhost. docker-compose uses service names (db, redis)
   - Secrets stay as ${SECRET_KEY} etc, pulled from .env
   - `.dockerignore`: venv/, __pycache__/, .env, notes
 - SQLAlchemy models `models/models.py` (six tables):
@@ -149,10 +149,25 @@
 - main.py: registered auth_router, products_router, inventory_router
 
 ## Phase 4 - Cart
-- Redis introduction and setup
-- services/cart_service.py
-- routers/cart_router.py
-- Cart stored in Redis, not PostgreSQL
+- Install redis: pip install redis, add to requirements.txt
+- Add Redis to docker-compose.yml: redis service (redis:7, port 6379:6379), api depends_on redis
+- Add REDIS_URL to .env (localhost) and docker-compose api environment (redis service name)
+- Add REDIS_URL to config.py with RuntimeError guard
+- schemas/schemas.py additions:
+  - CartItemRequest: product_id Field(gt=0), size Field(min_length=1, max_length=20), quantity Field(gt=0) — gt=0 not ge=0, adding zero items makes no sense
+  - CartItemResponse: product_id, size, quantity, price (Decimal)
+- services/cart_service.py:
+  - redis_client = redis.from_url(REDIS_URL) at module level
+  - Cart key pattern: f"cart:{user_id}"
+  - Item key pattern: f"{product_id}:{size}"
+  - add_to_cart(db, user_id, request): fetch product (404 if not found or inactive), build item dict, json.dumps, redis_client.hset — no return needed
+  - get_cart(user_id): hgetall, json.loads each value, return list of dicts
+  - remove_from_cart(user_id, product_id, size): hdel — no return needed
+  - No db session needed for get_cart and remove_from_cart (Redis only)
+- routers/cart_router.py: prefix="/cart", all require get_current_user
+  - POST /: add_to_cart, passes current_user.id (never trust client to send their own id)
+  - GET /: get_cart, response_model=List[CartItemResponse]
+  - DELETE /{product_id}/{size}: remove_from_cart
 
 ## Phase 5 - Orders and payments
 - Order endpoints and service
@@ -187,6 +202,10 @@ Do NOT import keyword arguments that go inside Column() with = signs: nullable, 
 utcnow() is deprecated in Python 3.12+. Use:
 from datetime import datetime, timezone
 datetime.now(timezone.utc)
+
+### Money types
+SQLAlchemy: Numeric(precision=10, scale=2). Pydantic: Decimal (from decimal import Decimal).
+Never Float for money.
 
 ### default vs onupdate in SQLAlchemy
 default=lambda: datetime.now(timezone.utc) for created_at, runs on record creation.
@@ -278,6 +297,34 @@ from services import product_service
 then call product_service.create_product(db, request)
 Avoids name collision where router function name shadows imported service function name.
 
+## Redis
+In-memory data store. Extremely fast (microseconds). Not permanent by default.
+Use for temporary/session data (cart). PostgreSQL for permanent records.
+
+### Redis hash commands
+hset(key, field, value) — add/update one field in a hash
+hgetall(key) — get all fields and values in a hash (returns dict)
+hdel(key, field) — delete one field from a hash
+
+### Cart structure
+Cart key: f"cart:{user_id}"
+Item key: f"{product_id}:{size}"
+Value: json.dumps({"product_id": ..., "size": ..., "quantity": ..., "price": ...})
+Redis stores strings only — use json.dumps to store, json.loads to retrieve.
+price stored as str(product.price) since Decimal is not JSON serializable.
+
+### Redis connection
+redis_client = redis.from_url(REDIS_URL) at module level. No session management needed.
+REDIS_URL: localhost in .env (for Mac tools), redis service name in docker-compose.
+
+
+Environment variables and config
+
+config.py: one place, all vars, all RuntimeError guards, int() conversion after None check.
+Secrets never committed. Local dev config (localhost URLs) safe to commit.
+Twelve factor: same code runs everywhere, only env vars change.
+Import execution: Python executes imported files fully before returning — RuntimeError fires at import time.
+
 ## Environment variables and config
 
 ### config.py pattern (professional standard)
@@ -343,6 +390,9 @@ Cart does not reserve stock, two users can add the same last item. Stock locks a
 checkout via SELECT FOR UPDATE: lock the inventory record, check quantity, one transaction succeeds,
 the other gets the updated (zero) quantity, and is rejected with 409 with a message like "item no longer available"
 
+### Cart add vs checkout
+Cart add does NOT reserve stock. Inventory lock happens at checkout via SELECT FOR UPDATE.
+
 ## True simultaneity does not exist
 Even nanosecond-apart requests resolve sequentially at the hardware level:
 network packets travel through physical cables with different latencies,
@@ -353,6 +403,9 @@ The database lock manager processes acquisition requests sequentially.
 Physics determines the order before the lock manager ever needs to decide.
 Client-side timing (device, network speed) does not determine who wins.
 What matters is which request's data is processed by the DATABASE SERVER's hardware first.
+
+### Product reactivation
+Dedicated POST /{id}/reactivate endpoint mirrors soft delete. More explicit and auditable than adding is_active to update schema. Admin must intentionally call it.
 
 ### Cart storage
 Cart lives in Redis (in memory, fast, temporary session data).
@@ -406,6 +459,9 @@ tags group endpoints in Swagger docs. Change prefix in one place, all endpoints 
 ### init.py in router folders
 Required to make the folder a Python package so imports work.
 Create an empty init.py in routers/, models/, schemas/, services/.
+
+### Never trust client input
+role, prices, is_active, user_id — always set or fetched server-side. current_user.id from JWT, not from request body.
 
 ## Alembic
 

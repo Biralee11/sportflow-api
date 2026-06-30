@@ -1,8 +1,10 @@
-from pydantic import BaseModel, field_validator, EmailStr, Field
+from pydantic import BaseModel, field_validator, EmailStr, Field, ConfigDict
 import re
 from datetime import datetime
 from typing import Optional
 from decimal import Decimal
+from enum import Enum
+from typing import List
 
 class RegisterRequest(BaseModel):
     email: EmailStr
@@ -89,3 +91,52 @@ class CartItemResponse(BaseModel):
     size: str
     quantity: int
     price: Decimal
+
+class PaymentMethodEnum(str, Enum):
+    card = "card"
+    paypal = "paypal"
+    apple_pay = "apple_pay"
+    google_pay = "google_pay"
+    bank_transfer = "bank_transfer"
+
+class PlaceOrderRequest(BaseModel):
+    payment_method: PaymentMethodEnum
+
+class PaymentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    order_id: int
+    amount: Decimal
+    status: str
+    payment_method: str
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+class OrderItemResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    order_id: int
+    product_id: int
+    quantity: int
+    price_at_purchase: Decimal
+
+class OrderResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    user_id: int
+    total_amount: Decimal
+    status: str
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    items: List[OrderItemResponse]
+    payment: PaymentResponse
+
+class OrderStatusEnum(str, Enum):
+    pending = "pending"
+    confirmed = "confirmed"
+    shipped = "shipped"
+    delivered = "delivered"
+    cancelled = "cancelled"
+
+class UpdateOrderStatusRequest(BaseModel):
+    status: OrderStatusEnum

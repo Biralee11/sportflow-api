@@ -31,3 +31,7 @@ def remove_from_cart(user_id: int, product_id: int, size: str):
         cart_key = f"cart:{user_id}"
         item_key = f"{product_id}:{size}"
         redis_client.hdel(cart_key, item_key)
+
+def clear_cart(user_id: int):
+    cart_key = f"cart:{user_id}"
+    redis_client.delete(cart_key)

@@ -1,6 +1,7 @@
 from database import Base
 from sqlalchemy import Column, String, Integer, DateTime, Boolean, Numeric, ForeignKey
 from datetime import datetime, timezone
+from sqlalchemy.orm import relationship
 
 class UserModel(Base):
     __tablename__ = "users"
@@ -42,14 +43,17 @@ class OrderModel(Base):
     status = Column(String, nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime, onupdate=lambda: datetime.now(timezone.utc))
+    items = relationship("OrderItemModel", back_populates="order")
+    payment = relationship("PaymentModel", uselist=False, back_populates="order")
 
 class OrderItemModel(Base):
     __tablename__ = "order_items"
     id = Column(Integer,primary_key=True,autoincrement=True)
-    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False)
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False) 
     product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
     quantity = Column(Integer, nullable=False)
     price_at_purchase = Column(Numeric(precision=10, scale=2), nullable=False)
+    order = relationship("OrderModel", back_populates="items")
 
 class PaymentModel(Base):
     __tablename__ = "payments"
@@ -60,3 +64,4 @@ class PaymentModel(Base):
     payment_method = Column(String, nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime, onupdate=lambda: datetime.now(timezone.utc))
+    order = relationship("OrderModel", back_populates="payment")
