@@ -140,3 +140,21 @@ class OrderStatusEnum(str, Enum):
 
 class UpdateOrderStatusRequest(BaseModel):
     status: OrderStatusEnum
+
+
+class UpdateProfileRequest(BaseModel):
+    first_name: Optional[str] = Field(None, min_length=1, max_length=50)
+    last_name: Optional[str] = Field(None, min_length=1, max_length=50)
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_password(cls, value):
+        if not re.search(r"[A-Z]", value):
+            raise ValueError("Password must contain at least one uppercase letter")
+        if not re.search(r"[^a-zA-Z0-9]", value):
+            raise ValueError("Password must contain at least one special character")
+        return value

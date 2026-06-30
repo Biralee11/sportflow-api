@@ -170,17 +170,25 @@
   - POST /: add_to_cart, passes current_user.id (never trust client to send their own id)
   - GET /: get_cart, response_model=List[CartItemResponse]
   - DELETE /{product_id}/{size}: remove_from_cart
-  - clear_cart (delete entire key)
+  - DELETE /: clear_cart (delete entire key)
 
 ## Phase 5 - Orders and payments
-- Order endpoints and service
-- Payment endpoints and service
-- Checkout calls inventory_service.decrement_stock() with SELECT FOR UPDATE locking
-- Checkout reads prices from database, never from client (never trust client input)
-- services/order_service.py
-- services/payment_service.py
-- routers/orders_router.py
-- routers/payments_router.py
+- schemas: PaymentMethodEnum, PlaceOrderRequest, OrderItemResponse (model_config from_attributes=True), PaymentResponse (model_config from_attributes=True), 
+  OrderResponse (nested items + payment, model_config from_attributes=True), OrderStatusEnum, UpdateOrderStatusRequest
+- Relationships added to models.py: OrderModel.items, OrderModel.payment (uselist=False), OrderItemModel.order, PaymentModel.order
+- services/payment_service.py: create_payment(db, order_id, amount, payment_method) — adds to session, NO commit (shares transaction with place_order)
+- services/order_service.py:
+  - place_order(db, user_id, request): full transaction — fetch cart, validate products/active, find inventory by product+size, decrement_stock, calculate total, 
+    create order + flush (get order.id without committing), create order_items, create_payment via payment_service, clear_cart, single commit at the end, refresh, return order
+  - get_order_by_id(db, id, user_id): filters by BOTH id AND user_id (IDOR protection)
+  - get_user_orders(db, user_id, page, limit): paginated, no raise on empty (consistent with get_all_products/get_all_inventory)
+  - update_order_status(db, id, request): admin only via router
+- routers/orders_router.py: prefix="/orders"
+  - POST /, GET /, GET /{id}: customer only, uses current_user.id (never accepts user_id from client)
+  - PUT /{id}/status: admin only
+  - No DELETE endpoint — cancellation via status update preserves audit trail
+- No payments_router.py — payment info embedded in OrderResponse via relationship (simple enough for current scope)
+- No update_payment_status function — real systems use payment provider webhooks (Stripe etc), not manual admin endpoints; documented as a conscious scope decision
 
 ## Phase 6 - Polish and deployment
 - User router: GET /users/me, PUT /users/me (calls user_service functions)
@@ -196,6 +204,24 @@
 # GENERAL DEV NOTES
 
 ## Python / SQLAlchemy
+
+### Relationships vs columns
+relationship() is a Python-level concept for navigating between linked tables — it does NOT create database columns and does NOT require a migration. The foreign key columns already define the actual link; relationship() just gives you convenient attribute access (order.items, order.payment).
+
+### One-to-many vs one-to-one relationships
+One-to-many: relationship("Model", back_populates="x") on both sides — e.g. OrderModel.items / OrderItemModel.order.
+One-to-one: add uselist=False on the "one" side — e.g. OrderModel.payment = relationship("PaymentModel", uselist=False, back_populates="order"). Without uselist=False, SQLAlchemy would treat it as one-to-many and return a list instead of a single object.
+
+### db.flush() vs db.commit()
+flush(): sends SQL, assigns generated values (like order.id) WITHIN the current transaction, but does NOT make it permanent. Needed when a later step in the same function needs the generated id (e.g. order_items need order.id before the order is fully committed).
+commit(): makes everything in the transaction permanent and ends it.
+If a transaction rolls back after a flush, the flushed data (including assigned IDs) disappears as if it never happened.
+
+### Transactions ("all or nothing")
+Every db.commit() commits a transaction. If any operation before the commit raises an exception, nothing in that transaction gets saved — the database is left exactly as it was before. This is critical for multi-step operations like checkout: order + order_items + payment + stock decrement + cart clear must all succeed together or none of them should.
+
+### Money type rule reminder
+Numeric (SQLAlchemy) / Decimal (Pydantic) everywhere. total_amount += current_price * quantity — always Decimal arithmetic, initialize accumulators as Decimal("0"), never plain 0.
 
 ### SQLAlchemy imports rule
 Import from SQLAlchemy anything that is a type or class: Column, String, Integer, DateTime, Boolean, ForeignKey, Numeric.
@@ -320,20 +346,16 @@ price stored as str(product.price) since Decimal is not JSON serializable.
 redis_client = redis.from_url(REDIS_URL) at module level. No session management needed.
 REDIS_URL: localhost in .env (for Mac tools), redis service name in docker-compose.
 
-
-Environment variables and config
-
-config.py: one place, all vars, all RuntimeError guards, int() conversion after None check.
-Secrets never committed. Local dev config (localhost URLs) safe to commit.
-Twelve factor: same code runs everywhere, only env vars change.
-Import execution: Python executes imported files fully before returning — RuntimeError fires at import time.
-
 ## Environment variables and config
 
 ### config.py pattern (professional standard)
 Never scatter load_dotenv() and os.getenv() across multiple files.
-Create config.py in the root, load and validate ALL env vars there,
+Create config.py in the root, load and validate ALL env vars there
+config.py: one place, all vars, all RuntimeError guards, int() conversion after None check.
 import from it everywhere else. One place to change if config ever changes.
+Secrets never committed. Local dev config (localhost URLs) safe to commit.
+Twelve factor: same code runs everywhere, only env vars change.
+Import execution: Python executes imported files fully before returning — RuntimeError fires at import time.
 
 ### Reading then converting env vars
 Read first, check None, then convert:
@@ -533,6 +555,9 @@ git ls-files | grep -E "^venv/|^\.env$"
 Escape the dot: .env unescaped matches any character + "env" (false positives
 like migrations/env.py).
 
+### "Invalid username or token" on push
+GitHub deprecated password authentication for git operations. If push suddenly fails with this error after previously working, it usually means a personal access token expired or got revoked, or credential caching reset. Fix: re-trigger the OAuth/device flow (e.g. VS Code will prompt to "authorize" — accept it), then retry git push. "Everything up-to-date" on retry confirms the earlier commit actually went through and the issue was purely authentication, not the commit itself.
+
 ## Regex
 
 ### Literal dot
@@ -700,6 +725,51 @@ Optional[X] = None = field can hold X or None, AND can be omitted entirely,
 defaulting to None if absent.
 For nullable=True columns (like updated_at), always use Optional[X] = None.
 
+### model_config = ConfigDict(from_attributes=True)
+Goes INSIDE the class body, same level as field definitions — not at module level.
+Needed when a response schema serializes a SQLAlchemy object with a NESTED relationship (e.g. OrderResponse.items needs to traverse OrderModel → OrderItemModel objects). Simple flat schemas (ProductResponse, UserResponse) work without it because Pydantic/FastAPI handle simple cases automatically — nested relationship traversal needs to be told explicitly to read via attributes (dot notation) rather than dictionary keys.
+Add to ALL schemas serializing SQLAlchemy objects with relationships, even ones nested two levels deep (both OrderItemResponse and OrderResponse needed it).
+
+### Enum for restricted string fields
+For fields where only specific values are valid (payment_method, order status), use a str Enum instead of a plain str:
+class PaymentMethodEnum(str, Enum):
+card = "card"
+paypal = "paypal"
+Then: payment_method: PaymentMethodEnum
+Pydantic rejects anything outside the defined values automatically with a clear error — no manual validator needed.
+This is intentionally case-sensitive/strict by default. For admin-only or internal-tool fields, strict matching is the better professional choice (predictable contract) over "lenient" normalization that can hide bugs.
+
+### Schema-level validation over relying on the database
+Always validate at the Field level (min_length, max_length, gt, ge) rather than relying solely on database nullable=False constraints. Gives cleaner, more meaningful client-facing errors instead of raw database errors.
+
+## Architecture and design patterns
+
+### IDOR (Insecure Direct Object Reference)
+A vulnerability where an API trusts a resource ID in the request without verifying the authenticated user actually owns that resource. Example: GET /orders/5 — if you only filter by order_id and not also by the logged-in user's id, customer A could view customer B's order just by guessing/incrementing IDs.
+Fix: always filter by BOTH the resource id AND the current_user.id from the JWT:
+db.query(OrderModel).filter(OrderModel.id == id, OrderModel.user_id == user_id).first()
+If it doesn't match either condition, return 404 either way — never reveal whether the resource exists but belongs to someone else (same enumeration principle as login).
+Never accept a "user_id" field from the client in the request body OR as a query/path parameter when the action concerns "my own" resources — always derive it from current_user.id via the auth dependency.
+
+### Empty list vs error
+GET-all endpoints with pagination should NEVER raise 404 for an empty result. An empty list is a valid, successful response ("there's nothing here yet"), not an error. Consistent across get_all_products, get_all_inventory, get_user_orders.
+
+### Sharing a db session across services within one transaction
+When one service function needs another service's help WITHIN the same atomic operation (e.g. place_order needs payment_service.create_payment), pass the SAME db session object as a parameter. Do NOT use Depends() inside a service function — Depends only works in FastAPI router functions. The called function should add() to the session but NOT commit — let the calling function's single commit cover the whole transaction.
+
+### Service file naming vs router file naming convention
+Routers: typically plural, matching the URL collection (products_router.py, orders_router.py). Exceptions for singular concepts (auth_router.py, cart_router.py — one cart per user).
+Services: typically singular, naming the domain/entity (product_service.py, order_service.py) — matches how you'd name a class (OrderService, not OrdersService).
+
+### Embedding related data vs separate router/endpoint
+When a resource (like payment) is simple, 1:1 with its parent, and read-only from the client's perspective, embed it in the parent's response schema via a relationship rather than building a separate router/endpoint just to view it. Build a dedicated router only when there's real business logic specific to that resource (refunds, webhooks, retries) that doesn't belong inside the parent's logic.
+
+### Real-world parallels for unbuilt features
+Payment status updates: in production this is handled by webhook callbacks from a payment provider (Stripe etc), not manual admin endpoints. Deliberately not building a fake "update payment status" endpoint avoids simulating an architecture that doesn't reflect reality — better to explain the omission than build something inaccurate.
+
+### Delete vs status update for financial/audit records
+Never hard-delete records that represent financial or audit history (orders). "Deleting" an order in the real world means cancelling it — a status change, not data destruction. Preserves the audit trail.
+
 
 
 
@@ -753,6 +823,20 @@ with __init__.py imports for larger codebases. Structure should match scale.
 ### Pagination on list endpoints
 Added to all list endpoints. Prevents unbounded responses. Shows awareness of real-world scale, not just "does it work on my laptop". Uses page/limit query params, offset calculation server-side.
 
+### payment_service.py kept separate even though minimal today
+Currently just one function (create_payment), and could have lived inside order_service.py. Kept it separate anticipating that payment logic (refunds, retries, webhook handling) tends to grow significantly more complex over a project's life — establishing the service boundary early means that growth happens in one place without entangling order logic. A genuine architecture trade-off, explainable either way.
+
+### Embedding payment in OrderResponse instead of a separate payments router
+Payment is 1:1 with an order and read-only from the client's side at this stage — no refunds, no webhooks yet. Embedding it via a SQLAlchemy relationship (uselist=False) into OrderResponse means viewing an order automatically shows its payment status, no extra endpoint or round trip needed. Would introduce a dedicated payments_router.py only once payment-specific logic (beyond simple status display) actually exists.
+
+### Cancellation via status update, not deletion
+Orders are never hard-deleted — they're financial/audit records. "Cancelling" an order is a status transition to "cancelled", preserving the full history of what happened. Mirrors how every serious eCommerce or fintech system treats order data.
+
+### Relationships are a navigation concept, not a schema change
+Demonstrated understanding that SQLAlchemy relationship() doesn't touch the database schema at all — it's purely Python-level convenience for traversing existing foreign keys. No migration was needed when relationships were added, only when actual columns change. Useful distinction to articulate clearly in an interview when discussing ORM internals.
+
+### Empty list is success, not failure
+GET-all endpoints (products, inventory, orders) return an empty list with 200 OK when there's nothing to show — never a 404. A 404 would incorrectly imply the endpoint itself is broken or the resource type doesn't exist, when really it's just an accurate, valid "nothing here yet" response.
 ---
 
 ## Data integrity
@@ -917,3 +1001,22 @@ Lock acquired on row. Concurrent transaction waits. First transaction checks qua
 
 ### Client vs server timing
 Customer's device and network speed don't decide who wins. The DATABASE SERVER's hardware processing order determines it. Don't conflate these in an interview.
+
+## Transactions and data integrity
+
+### Atomic checkout transaction
+place_order touches five things — cart, inventory, order, order_items, payment — and they all succeed or all fail together. Used db.flush() to get the generated order.id mid-transaction (needed for order_items) while deferring the actual commit until everything is ready, so a failure anywhere rolls back the entire operation cleanly, including the inventory decrement and the order record itself.
+
+### Why prices are re-fetched at checkout, never trusted from cart
+Cart stores price at time-of-add for display purposes, but checkout always re-reads price from the products table. A product's price can change between add-to-cart and checkout — trusting the cached cart price would let a customer pay an old (possibly lower) price, or just be plain wrong. Same "never trust cached/client data for financial calculations" principle as never trusting client-sent prices directly.
+
+## Security
+
+### IDOR (Insecure Direct Object Reference)
+Genuinely one of the most common real-world API vulnerabilities. Demonstrated awareness by filtering get_order_by_id by BOTH order id AND the authenticated user's id, never just the id alone — RBAC confirms who you are, it does not confirm you own the specific resource you're requesting. 404 is returned identically whether the order doesn't exist or belongs to someone else, preventing enumeration of valid order IDs.
+
+### Never accept identity-bearing fields from the client
+Across the whole project: role (register), price (cart), user_id (orders) — none of these are ever accepted from the client when they relate to "my own" identity or financial calculation. Always derived server-side from the JWT (current_user.id) or the database (product.price). One consistent principle applied repeatedly across very different endpoints.
+
+### Deliberate scope decisions, explained rather than faked
+Chose NOT to build a payment status update endpoint, because real systems update payment status via webhook callbacks from a provider (Stripe), not admin button-clicks. Demonstrates understanding that some "missing features" are actually correct architectural restraint, not gaps — a stronger interview answer than having built something that misrepresents how production payment systems actually work.
