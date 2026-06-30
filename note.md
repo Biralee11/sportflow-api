@@ -24,10 +24,11 @@
   - users: id, email, hashed_password, first_name, last_name, role (customer, admin), created_at, updated_at
   - products: id, name, description, price, category, image_url, is_active (True = available, False = soft delete), created_at, updated_at
   - inventory: id, product_id (FK), size, quantity, created_at, updated_at
-  - orders: id, user_id (FK), total_amount, status (pending, confirmed, shipped, delivered, cancelled), created_at, updated_at
-  - order_items: id, order_id (FK), product_id (FK), quantity, price_at_purchase
-  - payments: id, order_id (FK), amount, status (pending, completed, failed, refunded), payment_method (card, paypal, apple_pay, google_pay, bank_transfer), created_at, updated_at
-- Alembic migrations:
+  - orders: id, user_id (FK), total_amount, status (pending, confirmed, shipped, delivered, cancelled), created_at, updated_at, items (relationship), payment (relationship, uselist=False)
+  - order_items: id, order_id (FK), product_id (FK), quantity, price_at_purchase, order (relationship)
+  - payments: id, order_id (FK), amount, status (pending, completed, failed, refunded), payment_method (card, paypal, apple_pay, google_pay, bank_transfer), created_at, updated_at, 
+    order (relationship)
+- Alembic migrations: alembic init → configure env.py → docker compose up -d db → autogenerate → upgrade head
   - `alembic init migrations`
   - In `migrations/env.py`: import os, import Base and ALL models, add `config.set_main_option("sqlalchemy.url", os.getenv("DATABASE_URL"))`, set `target_metadata = Base.metadata`
   - Leave alembic.ini sqlalchemy.url as the default placeholder, never put real URLs in it
@@ -36,6 +37,7 @@
   - Generate migration: `alembic revision --autogenerate -m "create initial tables"`
   - Apply migration: `alembic upgrade head`
   - Verify tables in DBeaver (localhost:5432)
+  - Run new migration after every model COLUMN change (relationships don't need migrations — they're Python-level, foreign keys already exist)
 - Full stack test: `docker compose up -d --build`, check localhost:8000 and localhost:8000/docs
 - Git setup (first time):
   - Create `.gitignore`: venv/, __pycache__/, .env, notes.md, diagram files
@@ -168,6 +170,7 @@
   - POST /: add_to_cart, passes current_user.id (never trust client to send their own id)
   - GET /: get_cart, response_model=List[CartItemResponse]
   - DELETE /{product_id}/{size}: remove_from_cart
+  - clear_cart (delete entire key)
 
 ## Phase 5 - Orders and payments
 - Order endpoints and service

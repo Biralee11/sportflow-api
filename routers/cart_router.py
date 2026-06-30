@@ -20,3 +20,7 @@ def get_cart(current_user = Depends(get_current_user)):
 @router.delete("/{product_id}/{size}")
 def delete_from_cart(product_id: int, size: str, current_user = Depends(get_current_user)):
     return cart_service.remove_from_cart(current_user.id, product_id, size)
+
+@router.delete("/")
+def clear_cart(current_user = Depends(get_current_user)):
+    return cart_service.clear_cart(current_user.id)
