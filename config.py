@@ -33,3 +33,5 @@ if REDIS_URL is None:
     raise RuntimeError("REDIS_URL environment variable is not set")
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
+
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
