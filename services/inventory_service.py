@@ -8,6 +8,7 @@ def get_all_inventory(db: Session, page: int, limit: int):
     return all_inventory
 
 def get_inventory_by_product(db: Session, product_id: int):
+    # Returns a list: a single product can have many size variants, each its own row.
     inventory = db.query(InventoryModel).filter(InventoryModel.product_id == product_id).all()
     if not inventory:
         raise HTTPException(status_code=404, detail="Inventory not found")
@@ -33,6 +34,8 @@ def update_inventory(db: Session, id: int, request: InventoryUpdateRequest):
     return inventory
 
 def delete_inventory(db: Session, id: int):
+    # Hard delete is safe here: order_items captures product and price at purchase time,
+    # so removing a size variant never orphans historical order data.
     inventory = db.query(InventoryModel).filter(InventoryModel.id == id).first()
     if not inventory:
       raise HTTPException(status_code=404, detail="Inventory not found")
@@ -41,6 +44,10 @@ def delete_inventory(db: Session, id: int):
     return {"message": "Inventory deleted successfully"}
 
 def decrement_stock(db: Session, id: int, quantity_requested: int):
+    # with_for_update() locks this inventory row for the duration of the transaction.
+    # Concurrent checkouts for the same item must wait for this lock, so two customers
+    # cannot both buy the last unit - the second sees the updated quantity and is rejected.
+    # The lock is released automatically on commit.
     inventory = db.query(InventoryModel).filter(InventoryModel.id == id).with_for_update().first()
     if not inventory:
       raise HTTPException(status_code=404, detail="Inventory not found")
