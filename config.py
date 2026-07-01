@@ -31,3 +31,7 @@ if DATABASE_URL is None:
 REDIS_URL = os.getenv("REDIS_URL")
 if REDIS_URL is None:
     raise RuntimeError("REDIS_URL environment variable is not set")
+
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
+if TEST_DATABASE_URL is None:
+    raise RuntimeError("TEST_DATABASE_URL environment variable is not set")
